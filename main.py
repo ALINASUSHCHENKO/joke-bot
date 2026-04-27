@@ -1,9 +1,10 @@
 import os
 import sys
+import asyncio
 from datetime import datetime
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 
 MAX_HISTORY_MESSAGES = 10
@@ -22,8 +23,8 @@ def load_config():
     return api_key, base_url, model
 
 
-def create_client(api_key: str, base_url: str) -> OpenAI:
-    return OpenAI(api_key=api_key, base_url=base_url)
+def create_client(api_key: str, base_url: str) -> AsyncOpenAI:
+    return AsyncOpenAI(api_key=api_key, base_url=base_url)
 
 
 def get_system_message():
@@ -31,8 +32,8 @@ def get_system_message():
         "role": "system",
         "content": (
             "Ты бот, который рассказывает анекдоты, шутки и короткие смешные истории. "
-            "Если пользователь задает тему — шути по теме. "
-            "Если тема не указана — расскажи любой хороший анекдот. "
+            "Если пользователь задает тему - шути по теме. "
+            "Если тема не указана - расскажи любой хороший анекдот. "
             "Шутки должны быть добрыми, без грубости, оскорблений и политики."
         ),
     }
@@ -104,8 +105,8 @@ def handle_command(text: str, history: list[dict], request_count: int, model: st
     return None
 
 
-def request_joke(
-    client: OpenAI,
+async def request_joke(
+    client: AsyncOpenAI,
     model: str,
     system_message: dict,
     history: list[dict],
@@ -114,7 +115,7 @@ def request_joke(
     messages = [system_message] + history + [{"role": "user", "content": user_text}]
 
     try:
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=0.8,
@@ -129,7 +130,7 @@ def request_joke(
         return None
 
 
-def main():
+async def main():
     try:
         api_key, base_url, model = load_config()
     except ValueError as e:
@@ -155,11 +156,9 @@ def main():
 
     while True:
         try:
-            user_text = input("\nВы: ").strip()
-        except KeyboardInterrupt:
-            print("\nВыход.")
-            break
-        except EOFError:
+            user_text = await asyncio.to_thread(input, "\nВы: ")
+            user_text = user_text.strip()
+        except (KeyboardInterrupt, EOFError):
             print("\nВыход.")
             break
 
@@ -172,7 +171,7 @@ def main():
         if command_result == "handled":
             continue
 
-        joke = request_joke(client, model, system_message, history, user_text)
+        joke = await request_joke(client, model, system_message, history, user_text)
         if joke is None:
             continue
 
@@ -183,7 +182,8 @@ def main():
         trim_history(history)
 
         request_count += 1
+    await client.close()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
