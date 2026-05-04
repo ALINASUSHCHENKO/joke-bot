@@ -13,5 +13,5 @@
 
 1. Клонируйте репозиторий:
 ```bash
-git clone https://github.com/ваш-логин/joke-bot.git
+git clone https://github.com/ALINASUSHCHENKO/joke-bot.git
 cd joke-bot
