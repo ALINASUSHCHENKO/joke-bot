@@ -1,132 +1,92 @@
 import os
-import sys
 import asyncio
-from datetime import datetime
-
+import aiosqlite
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 
-MAX_HISTORY_MESSAGES = 10
-
-
 def load_config():
     load_dotenv()
-
     api_key = os.getenv("API_KEY")
     if not api_key:
-        raise ValueError("В .env не найден API_KEY")
-
+        raise ValueError("API_KEY not found")
     base_url = os.getenv("BOTHUB_BASE_URL", "https://bothub.chat/api/v2/openai/v1")
     model = os.getenv("JOKE_MODEL", "gpt-3.5-turbo")
-
     return api_key, base_url, model
 
 
-def create_client(api_key: str, base_url: str) -> AsyncOpenAI:
+def create_client(api_key, base_url):
     return AsyncOpenAI(api_key=api_key, base_url=base_url)
 
 
 def get_system_message():
     return {
         "role": "system",
-        "content": (
-            "Ты бот, который рассказывает анекдоты, шутки и короткие смешные истории. "
-            "Если пользователь задает тему - шути по теме. "
-            "Если тема не указана - расскажи любой хороший анекдот. "
-            "Шутки должны быть добрыми, без грубости, оскорблений и политики."
-        ),
+        "content": "Ты бот, рассказывающий анекдоты. Отвечай кратко и с юмором. Избегай темы про политику и жестокость."
     }
 
 
-def trim_history(history: list[dict]) -> None:
-    if len(history) > MAX_HISTORY_MESSAGES:
-        del history[:-MAX_HISTORY_MESSAGES]
+async def init_db():
+    async with aiosqlite.connect("chat.db") as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        await db.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER, role TEXT, content TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (session_id) REFERENCES sessions (id))")
+        await db.commit()
 
 
-def print_help():
-    print("\nКоманды:")
-    print("  анекдот / расскажи анекдот")
-    print("  анекдот про ...")
-    print("  история")
-    print("  очистить")
-    print("  статистика")
-    print("  помощь")
-    print("  выход")
+async def create_session():
+    async with aiosqlite.connect("chat.db") as db:
+        cursor = await db.execute("INSERT INTO sessions DEFAULT VALUES")
+        await db.commit()
+        return cursor.lastrowid
 
 
-def show_history(history: list[dict]):
-    if not history:
-        print("История пуста.")
-        return
-
-    print("\nПоследние сообщения:")
-    for i, msg in enumerate(history, start=1):
-        role = "Вы" if msg["role"] == "user" else "Бот"
-        text = msg["content"].strip().replace("\n", " ")
-        if len(text) > 120:
-            text = text[:120] + "..."
-        print(f"{i}. {role}: {text}")
+async def add_message(session_id, role, content):
+    async with aiosqlite.connect("chat.db") as db:
+        await db.execute("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)", (session_id, role, content))
+        await db.commit()
 
 
-def show_stats(request_count: int, history: list[dict], model: str, base_url: str):
-    print("\nСтатистика:")
-    print(f"  Анекдотов получено: {request_count}")
-    print(f"  Сообщений в истории: {len(history)}")
-    print(f"  Модель: {model}")
-    print(f"  API endpoint: {base_url}")
-    print(f"  Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+async def get_context(session_id):
+    async with aiosqlite.connect("chat.db") as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 10", (session_id,))
+        rows = await cursor.fetchall()
+        return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
 
 
-def handle_command(text: str, history: list[dict], request_count: int, model: str, base_url: str):
-    cmd = text.strip().lower()
-
-    if cmd in {"выход", "exit", "quit", "q"}:
-        print(f"Пока. За эту сессию получено анекдотов: {request_count}")
-        return "exit"
-
-    if cmd in {"помощь", "help", "?"}:
-        print_help()
+async def handle_command(cmd, session_id):
+    if cmd == "/history":
+        history = await get_context(session_id)
+        for msg in history:
+            print(f"{msg['role'].upper()}: {msg['content']}")
         return "handled"
-
-    if cmd in {"история", "history", "h"}:
-        show_history(history)
+    elif cmd == "/sessions":
+        async with aiosqlite.connect("chat.db") as db:
+            async with db.execute("SELECT id, created_at FROM sessions ORDER BY id DESC LIMIT 5") as cursor:
+                async for row in cursor:
+                    print(f"ID: {row[0]}, Created: {row[1]}")
         return "handled"
-
-    if cmd in {"очистить", "clear", "c"}:
-        history.clear()
-        print("История очищена.")
-        return "handled"
-
-    if cmd in {"статистика", "stats", "s"}:
-        show_stats(request_count, history, model, base_url)
-        return "handled"
-
     return None
 
 
-async def request_joke(
-    client: AsyncOpenAI,
-    model: str,
-    system_message: dict,
-    history: list[dict],
-    user_text: str,
-) -> str | None:
-    messages = [system_message] + history + [{"role": "user", "content": user_text}]
-
+async def request_joke(client, model, system_message, context):
     try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.8,
-            max_tokens=300,
-            frequency_penalty=0.5,
-            presence_penalty=0.5,
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model,
+                messages=[system_message] + context,
+                temperature=0.8
+            ),
+            timeout=30
         )
-        return response.choices[0].message.content.strip()
+        if response.choices and response.choices[0].message and response.choices[0].message.content:
+            return response.choices[0].message.content.strip()
+        return None
+    except asyncio.TimeoutError:
+        print("\nTimeout.")
+        return None
     except Exception as e:
-        print(f"Ошибка API: {e}")
-        print("Проверь API_KEY, баланс, base_url и интернет-соединение.")
+        print(f"\nError: {e}")
         return None
 
 
@@ -134,56 +94,48 @@ async def main():
     try:
         api_key, base_url, model = load_config()
     except ValueError as e:
-        print(f"Ошибка конфигурации: {e}")
-        print("Создай файл .env и добавь строку:")
-        print("API_KEY=твой_ключ")
-        sys.exit(1)
+        print(f"Config error: {e}")
+        return
 
-    try:
-        client = create_client(api_key, base_url)
-    except Exception as e:
-        print(f"Не удалось создать клиента: {e}")
-        sys.exit(1)
-
+    client = create_client(api_key, base_url)
+    await init_db()
+    session_id = await create_session()
     system_message = get_system_message()
-    history: list[dict] = []
-    request_count = 0
 
-    print("Анекдот-бот запущен.")
-    print(f"Модель: {model}")
-    print(f"Храню до {MAX_HISTORY_MESSAGES} последних сообщений.")
-    print("Напиши 'помощь', чтобы увидеть команды.")
+    print(f"Session: {session_id}. Commands: /new, /history, /sessions, /exit")
 
     while True:
         try:
-            user_text = await asyncio.to_thread(input, "\nВы: ")
-            user_text = user_text.strip()
+            user_text = await asyncio.to_thread(input, "\n> ")
         except (KeyboardInterrupt, EOFError):
-            print("\nВыход.")
             break
+
+        cmd = user_text.strip().lower()
+
+        if cmd == "/exit":
+            break
+        elif cmd == "/new":
+            session_id = await create_session()
+            print(f"Session: {session_id}")
+            continue
+        
+        result = await handle_command(cmd, session_id)
+        if result == "handled":
+            continue
 
         if not user_text:
             continue
 
-        command_result = handle_command(user_text, history, request_count, model, base_url)
-        if command_result == "exit":
-            break
-        if command_result == "handled":
-            continue
+        await add_message(session_id, "user", user_text)
+        context = await get_context(session_id)
+        
+        response = await request_joke(client, model, system_message, context)
 
-        joke = await request_joke(client, model, system_message, history, user_text)
-        if joke is None:
-            continue
+        if response:
+            print(f"Bot: {response}")
+            await add_message(session_id, "assistant", response)
 
-        print(f"Бот: {joke}")
-
-        history.append({"role": "user", "content": user_text})
-        history.append({"role": "assistant", "content": joke})
-        trim_history(history)
-
-        request_count += 1
     await client.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
